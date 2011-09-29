@@ -30,8 +30,10 @@ typedef struct {
   int cookie_life;                 /* the duration for which the cookie should live */
   const char *remote_server;       /* hostname/ip for the remote server */
   const char *remote_path;         /* the protected resource on the remote server */
+  char method;                     /* how to manage session - 'c'ookie or 'h'ash */
   const char *cookie_name;         /* the name of the cookie */
   const char *cookie_path;         /* the cookie path */
+  apr_hash_t *user_sessions;       /* hash of logged in users along wit their timeout */
 } auth_remote_config_rec;
 
 
@@ -44,12 +46,35 @@ static void *create_auth_remote_dir_config(apr_pool_t *p, char *d)
   conf->cookie_life = NOT_CONFIGURED;
   conf->remote_server = NULL;
   conf->remote_path = NULL;
+
+  conf->method= 'h';                //default to using hash to manage sessions
   conf->cookie_name = NULL;
   conf->cookie_path = NULL;
+  conf->user_sessions = apr_hash_make( p);
   
   want_salt = 1;
 
   return conf;
+}
+
+static const char *auth_remote_parse_method( cmd_parms *cmd, void *config, const char *arg)
+{
+  auth_remote_config_rec *conf = config;
+
+  // cookie or hash
+  if (apr_strnatcasecmp( arg, "cookie") == 0) {
+    //set flag for cookie
+    conf->method= 'c';
+  }
+  else if (apr_strnatcasecmp( arg, "hash") == 0) {
+    //set flag for hash
+    conf->method= 'h';
+  }
+  else {
+    return "AuthRemoteMethod must either be 'cookie' or 'hash'";
+  }
+
+  return NULL;  
 }
 
 static const char *auth_remote_parse_loc(cmd_parms *cmd, void *config, const char *arg)
@@ -116,6 +141,9 @@ static const command_rec auth_remote_cmds[] =
     /* accepts a full url, superceedes AuthRemotePort and AuthRemoteServer */
     AP_INIT_TAKE1("AuthRemoteURL", auth_remote_parse_loc, NULL, OR_AUTHCFG,
                   "remote server path or full url to authenticate against"),
+
+    AP_INIT_TAKE1("AuthRemoteMethod", auth_remote_parse_method, NULL, OR_AUTHCFG,
+                  "method to use to validate login - either cookie or memory hash"),
     AP_INIT_TAKE123("AuthRemoteCookie", auth_remote_config_cookie, NULL, OR_AUTHCFG,
                     "name of the cookie, the cookie path and the duration it is valid for"),
     {NULL}
