@@ -27,13 +27,19 @@ short want_salt = 0;
 
 typedef struct {
   int remote_port;                 /* the remote port of the authenticating server */
-  int cookie_life;                 /* the duration for which the cookie should live */
   const char *remote_server;       /* hostname/ip for the remote server */
   const char *remote_path;         /* the protected resource on the remote server */
-  char method;                     /* how to manage session - 'c'ookie or 'h'ash */
+
+  char session_method;             /* how to manage session - 'c'ookie or 'h'ash */
+  int session_life;                /* the duration for which the session should live */
+
+  apr_hash_t *user_sessions;       /* hash of logged in users along wit their timeout */
+  apr_pool_t *session_pool;         /* pool that has lifespan that matches module */
+  apr_int64_t cleanup_interval;    /* how often we need to clean hash of user sessions */
+  apr_int64_t last_cleanup;        /* time we last cleaned old strings in session hash */
+
   const char *cookie_name;         /* the name of the cookie */
   const char *cookie_path;         /* the cookie path */
-  apr_hash_t *user_sessions;       /* hash of logged in users along wit their timeout */
 } auth_remote_config_rec;
 
 
@@ -43,18 +49,35 @@ static void *create_auth_remote_dir_config(apr_pool_t *p, char *d)
 {
   auth_remote_config_rec *conf = apr_palloc(p, sizeof(*conf));
   conf->remote_port = NOT_CONFIGURED;
-  conf->cookie_life = NOT_CONFIGURED;
   conf->remote_server = NULL;
   conf->remote_path = NULL;
 
-  conf->method= 'h';                //default to using hash to manage sessions
+  conf->session_method= 'h';                //default to using hash to manage sessions
+  conf->session_life = TWENTY_MINS;
+
+  conf->user_sessions = apr_hash_make( p);
+  apr_pool_create( &(conf->session_pool), p);
+  conf->last_cleanup = apr_time_sec(apr_time_now());
+  conf->cleanup_interval = 14400;           // default to 4 hours
+
   conf->cookie_name = NULL;
   conf->cookie_path = NULL;
-  conf->user_sessions = apr_hash_make( p);
   
   want_salt = 1;
 
   return conf;
+}
+
+static const char *auth_remote_parse_cleanup( cmd_parms *cmd, void *config, const char *arg)
+{
+  auth_remote_config_rec *conf = config;
+
+  //how many seconds before need to cleanup user session hash
+  conf->cleanup_interval= atoi(arg);
+  if (conf->cleanup_interval == 0)
+    return "AuthRemoteSessionCleanupInterval must be a number (> 0)";
+
+  return NULL;
 }
 
 static const char *auth_remote_parse_method( cmd_parms *cmd, void *config, const char *arg)
@@ -64,11 +87,11 @@ static const char *auth_remote_parse_method( cmd_parms *cmd, void *config, const
   // cookie or hash
   if (apr_strnatcasecmp( arg, "cookie") == 0) {
     //set flag for cookie
-    conf->method= 'c';
+    conf->session_method= 'c';
   }
   else if (apr_strnatcasecmp( arg, "hash") == 0) {
     //set flag for hash
-    conf->method= 'h';
+    conf->session_method= 'h';
   }
   else {
     return "AuthRemoteMethod must either be 'cookie' or 'hash'";
@@ -107,8 +130,21 @@ static const char *auth_remote_parse_loc(cmd_parms *cmd, void *config, const cha
   return NULL;
 }
 
+static const char *auth_remote_parse_timeout(cmd_parms *cmd, void *config, const char *arg)
+{
+  auth_remote_config_rec *conf = config;
+  apr_int64_t timeout;
+  
+  timeout= atoi( arg);
+  if (timeout)
+    conf->session_life = timeout;
+
+    return "AuthSessionTimeout must be a number (>0)";
+      
+  return NULL;
+}
 static const char *auth_remote_config_cookie(cmd_parms *cmd, void *config, const char *arg1, 
-                                             const char *arg2, const char *arg3)
+                                             const char *arg2)
 {
 #ifdef AUTH_REMOTE_NO_SALT
   return "AuthRemoteCookie can only be used if mod_auth_remote is compiled with random() support";
@@ -119,10 +155,6 @@ static const char *auth_remote_config_cookie(cmd_parms *cmd, void *config, const
     conf->cookie_path = arg2;
   else 
     conf->cookie_path = "/";
-  if (arg3) 
-    conf->cookie_life = atoi(arg3);
-  else
-    conf->cookie_life = TWENTY_MINS;
   
   return NULL;
 #endif
@@ -143,8 +175,14 @@ static const command_rec auth_remote_cmds[] =
                   "remote server path or full url to authenticate against"),
 
     AP_INIT_TAKE1("AuthRemoteMethod", auth_remote_parse_method, NULL, OR_AUTHCFG,
-                  "method to use to validate login - either cookie or memory hash"),
-    AP_INIT_TAKE123("AuthRemoteCookie", auth_remote_config_cookie, NULL, OR_AUTHCFG,
+                  "method to use to validate login - either 'cookie' or memory 'hash'"),
+    AP_INIT_TAKE1("AuthRemoteSessionTimeout", auth_remote_parse_timeout, NULL, OR_AUTHCFG,
+                  "how long user stays logged in - in seconds"),
+
+    AP_INIT_TAKE1("AuthRemoteSessionCleanupInterval", auth_remote_parse_cleanup, NULL, OR_AUTHCFG, 
+                  "how ofter (in seconds) user session hash should be cleaned up"),
+
+    AP_INIT_TAKE12("AuthRemoteCookie", auth_remote_config_cookie, NULL, OR_AUTHCFG,
                     "name of the cookie, the cookie path and the duration it is valid for"),
     {NULL}
   };
@@ -193,7 +231,7 @@ static short auth_remote_validate_cookie(request_rec *r, const char *exp_user, c
     return 0;
   }
   old_time = apr_atoi64(tstamp);
-  if ((new_time - old_time) > conf->cookie_life) {
+  if ((new_time - old_time) > conf->session_life) {
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "cookie expired for %s", exp_user);
     return 0;
   }
@@ -306,19 +344,46 @@ static authn_status check_authn(request_rec *r, const char *user, const char *pa
   authn_status remote_status = AUTH_DENIED;
   auth_remote_config_rec *conf = ap_get_module_config(r->per_dir_config, &auth_remote_module);
 
-  /* no auth cookie was configured, authn against remote server */
-  if (conf->cookie_life == NOT_CONFIGURED) {
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cookie is not configured");
-    return do_remote_auth(r, user, passwd, conf);
-  }
+  if (conf->session_method == 'h') {
+    //hash based users sessions
 
-  /* cookie is configured, check if a cookie came in */
-  cookies = apr_table_get(r->headers_in, "Cookie");
-  if (cookies) {
-    char *our_cookie = ap_strstr((char *)cookies, conf->cookie_name);
-    if (our_cookie && auth_remote_validate_cookie(r, user, our_cookie, conf)) {
-      return AUTH_GRANTED;
+    char *session;
+    session= (char *) apr_hash_get( conf->user_sessions, user, APR_HASH_KEY_STRING);
+    
+    //if NULL, need to fall below to do_remote_auth
+    if (session) {
+      //get current time
+      apr_int64_t old_time;
+   
+      apr_time_t new_time = apr_time_sec(apr_time_now());
+      old_time = apr_atoi64(session);
+      if ((new_time - old_time) < conf->session_life) {
+        return AUTH_GRANTED;  
+      }
+      ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "session expired for %s", user);
     }
+    
+    //need to validate user & password with remote server 
+      
+  } 
+  else {
+    //cookie based sessions
+
+    /* no auth cookie was configured, authn against remote server */
+    if (conf->session_life == NOT_CONFIGURED) {
+      ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "cookie is not configured");
+      return do_remote_auth(r, user, passwd, conf);
+    }
+
+    /* cookie is configured, check if a cookie came in */
+    cookies = apr_table_get(r->headers_in, "Cookie");
+    if (cookies) {
+      char *our_cookie = ap_strstr((char *)cookies, conf->cookie_name);
+      if (our_cookie && auth_remote_validate_cookie(r, user, our_cookie, conf)) {
+        return AUTH_GRANTED;
+      }
+    }
+    
   }
   
   /** If our cookie 
@@ -328,8 +393,17 @@ static authn_status check_authn(request_rec *r, const char *user, const char *pa
    *  in all these cases always force a remote authentication and reset the cookie if needed 
    **/
   remote_status = do_remote_auth(r, user, passwd, conf);
+
   if (remote_status == AUTH_GRANTED) {
-    auth_remote_set_cookie(r, user, conf);
+    if (conf->session_method == 'c') {
+      auth_remote_set_cookie(r, user, conf);
+    }
+    else {
+      apr_time_t now = apr_time_sec(apr_time_now());
+      //TODO: user & timestampe strings should come for our own pool that we can cleanup periodically
+      char *timestamp = apr_psprintf( conf->session_pool, "%ld", now);
+      apr_hash_set( conf->user_sessions, user, APR_HASH_KEY_STRING, timestamp);
+    }
   }
   return remote_status;
 }
