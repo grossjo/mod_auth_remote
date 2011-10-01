@@ -23,7 +23,7 @@
 
 #define TWENTY_MINS     1200          //in seconds
 #define FOUR_HOURS      14400         //in seconds
-#define DEFAULT_TIMEOUT 15000         //15 seconds - in milliseconds
+#define DEFAULT_TIMEOUT 5000000       //5 sec - in microseconds
 
 #define AUTH_REMOTE_COOKIE "auth_remote_cookie"
 
@@ -370,8 +370,13 @@ static authn_status check_authn(request_rec *r, const char *user, const char *pa
   authn_status remote_status = AUTH_DENIED;     //default to denied
   apr_time_t now = apr_time_sec(apr_time_now());
 
+  ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "received AUTH request for user %s", user);
+
   if (conf->session_method == 'h') {
     //hash based users sessions
+
+    unsigned int count= apr_hash_count( conf->sessions);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "hash count %u", count);
 
     //before we check user credentials, see if we need to cleanup hash of session
     if (now > (conf->last_cleanup + conf->cleanup_interval)) {
@@ -387,23 +392,34 @@ static authn_status check_authn(request_rec *r, const char *user, const char *pa
     //if NULL, need to fall below to do_remote_auth
     if (session_start) {
       //get current time   
-      if ((now - (*session_start)) < conf->session_life)
-        return AUTH_GRANTED;
+      ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "found session for user %s", user);
+      if ((now - (*session_start)) < conf->session_life) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "session valid for user %s", user);
+        return AUTH_GRANTED;        
+      }
 
       //else
       ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "session expired for %s", user);
     }
-    
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "no session found for user %s", user);
+    }    
     //need to validate user & password with remote server 
     remote_status = do_remote_auth(r, user, passwd, conf);
     if (remote_status == AUTH_GRANTED) {
+      ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "backend authorized user %s", user);
+
       if (session_start == NULL) {
         session_start= (apr_time_t *) apr_palloc( conf->module_pool, sizeof(now));
         *session_start= now;
         apr_hash_set( conf->sessions, user, sizeof(now), session_start);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "created new session for user %s", user);
       }
-      else    //reset session start time to now
-        *session_start= now;
+      else {
+        //reset session start time to now
+        *session_start= now;        
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "updated session for user %s", user);
+      } 
     }
       
   } 
