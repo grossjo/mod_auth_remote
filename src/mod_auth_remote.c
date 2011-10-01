@@ -412,7 +412,7 @@ static authn_status check_authn(request_rec *r, const char *user, const char *pa
       if (session_start == NULL) {
         session_start= (apr_time_t *) apr_palloc( conf->module_pool, sizeof(now));
         *session_start= now;
-        apr_hash_set( conf->sessions, user, sizeof(now), session_start);
+        apr_hash_set( conf->sessions, user, APR_HASH_KEY_STRING, session_start);
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r, "created new session for user %s", user);
       }
       else {
